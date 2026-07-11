@@ -17241,6 +17241,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
                 }
+
+                // Intel GPUs encounter severe shader loops / 10s ring buffer fence timeouts
+                // on large sparse Mixture of Experts (MoE) matrix arrays. Fallback to host CPU.
+                if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+                    if (op->src[0]->ne[2] > 16)
+                        return false;
+                }
+
                 switch (src0_type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
