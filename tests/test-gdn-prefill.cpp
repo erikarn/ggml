@@ -24,15 +24,14 @@
 
 #include <ggml.h>
 #include <ggml-backend.h>
+#include <ggml-cpp.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -53,7 +52,6 @@ static void init_tensor_uniform(ggml_tensor *t, float min = -1.0f, float max = 1
     if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
     } else {
-        // Fallback for non-float types (should not be hit in this test)
         GGML_ABORT("unsupported tensor type");
     }
 }
@@ -94,26 +92,28 @@ struct gdn_prefill_test {
         : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens),
           n_seqs(n_seqs), v_repeat(v_repeat), kda(kda), K(K) {}
 
-    // Build compute graph and run on two backends, compare results.
+    // Build compute graph and compare GPU vs CPU via ggml_backend_compare_graph_backend.
     // Returns true if test passed.
     bool run(ggml_backend_t gpu, ggml_backend_t cpu_ref, double &out_nmse,
              bool verbose = false) const {
-        // Allocate contexts
-        size_t ctx_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead();
-        auto ctx_cpu = std::unique_ptr<ggml_context, decltype(&free)>(
-            (ggml_context *)malloc(ctx_size), free);
-        auto ctx_gpu = std::unique_ptr<ggml_context, decltype(&free)>(
-            (ggml_context *)malloc(ctx_size), free);
-        if (!ctx_cpu || !ctx_gpu) {
+        // Context with no_alloc=true — only metadata, data allocated by backend
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        auto ctx = std::unique_ptr<ggml_context, decltype(&free)>(
+            (ggml_context *)malloc(params.mem_size), free);
+        if (!ctx) {
             fprintf(stderr, "%s: context allocation failed\n", label().c_str());
             return false;
         }
 
-        ggml_init_params cp = { .mem_size = ctx_size, .mem_buffer = nullptr, .no_alloc = false };
-        // We use malloc'd memory, so init manually
-        // Actually let's use ggml_init with the buffer
-        ggml_context *gc = ctx_cpu.get();
-        ggml_context *gg = ctx_gpu.get();
+        ggml_context *gc = ggml_init(params);
+        if (!gc) {
+            fprintf(stderr, "%s: ggml_init failed\n", label().c_str());
+            return false;
+        }
 
         // Create tensors — same shapes as test_gated_delta_net in test-backend-ops.cpp
         const int64_t g_ne0 = kda ? head_size : 1;
@@ -133,77 +133,93 @@ struct gdn_prefill_test {
         // GDN op
         ggml_tensor *out = ggml_gated_delta_net(gc, q, k, v, g, b, st, K);
 
-        // Initialize inputs
-        init_tensor_uniform(q, -1.0f, 1.0f);
-        init_tensor_uniform(k, -1.0f, 1.0f);
-        init_tensor_uniform(v, -0.3f, 5.0f);
-        init_tensor_uniform(g, -20.0f, -1e-4f);
-        init_tensor_uniform(b, 0.0f, 1.0f);
-        init_tensor_uniform(st, -1.0f, 1.0f);
-
-        // Copy graph for GPU backend (same operations, different device placement)
-        ggml_tensor *q_g  = ggml_dup_tensor(gg, q);
-        ggml_tensor *k_g  = ggml_dup_tensor(gg, k);
-        ggml_tensor *v_g  = ggml_dup_tensor(gg, v);
-        ggml_tensor *g_g  = ggml_dup_tensor(gg, g);
-        ggml_tensor *b_g  = ggml_dup_tensor(gg, b);
-        ggml_tensor *st_g = ggml_dup_tensor(gg, st);
-
-        // Need to rebuild the graph on GPU context with same structure
-        // Simpler approach: copy tensors then rebuild
-        ggml_backend_tensor_copy(q, q_g);
-        ggml_backend_tensor_copy(k, k_g);
-        ggml_backend_tensor_copy(v, v_g);
-        ggml_backend_tensor_copy(g, g_g);
-        ggml_backend_tensor_copy(b, b_g);
-        ggml_backend_tensor_copy(st, st_g);
-
-        // Rebuild graph on GPU context
-        q_g = ggml_l2_norm(gg, q_g, 1e-6f);
-        k_g = ggml_l2_norm(gg, k_g, 1e-6f);
-        ggml_tensor *out_g = ggml_gated_delta_net(gg, q_g, k_g, v_g, g_g, b_g, st_g, K);
-
-        // Build forward graphs
+        // Build forward graph
         ggml_cgraph *gf = ggml_new_graph(gc);
         ggml_build_forward_expand(gf, out);
 
-        ggml_cgraph *gf_gpu = ggml_new_graph(gg);
-        ggml_build_forward_expand(gf_gpu, out_g);
-
-        // Execute on CPU reference
-        ggml_backend_graph_compute(cpu_ref, gf);
-
-        // Execute on GPU backend
-        ggml_backend_graph_compute(gpu, gf_gpu);
-
-        // Read results
-        size_t out_nels = ggml_nelements(out);
-        std::vector<float> result_cpu(out_nels);
-        std::vector<float> result_gpu(out_nels);
-        ggml_backend_tensor_get(out, result_cpu.data(), 0, out_nels * sizeof(float));
-        ggml_backend_tensor_get(out_g, result_gpu.data(), 0, out_nels * sizeof(float));
-
-        // Compute NMSE
-        double err = nmse(result_gpu.data(), result_cpu.data(), out_nels);
-        out_nmse = err;
-
-        // Check for NaN/Inf
-        bool has_nan = false, has_inf = false;
-        for (size_t i = 0; i < out_nels; i++) {
-            if (std::isnan(result_gpu[i])) { has_nan = true; break; }
-            if (std::isinf(result_gpu[i])) { has_inf = true; break; }
+        // Allocate tensors on CPU backend first
+        ggml_backend_buffer_ptr buf_cpu(ggml_backend_alloc_ctx_tensors(gc, cpu_ref));
+        if (!buf_cpu) {
+            fprintf(stderr, "%s: failed to allocate CPU tensors\n", label().c_str());
+            return false;
         }
+
+        // Initialize leaf input tensors
+        for (ggml_tensor *t = ggml_get_first_tensor(gc); t != nullptr; t = ggml_get_next_tensor(gc, t)) {
+            if (ggml_is_view(t)) {
+                continue;
+            }
+            init_tensor_uniform(t);
+        }
+
+        // Compare GPU vs CPU using ggml_backend_compare_graph_backend
+        struct callback_userdata {
+            bool   ok;
+            double nmse_sum;
+            size_t nmse_count;
+            bool   has_nan;
+            bool   has_inf;
+        };
+
+        callback_userdata ud {
+            .ok = true,
+            .nmse_sum = 0.0,
+            .nmse_count = 0,
+            .has_nan = false,
+            .has_inf = false,
+        };
+
+        auto callback = [](int /*index*/, ggml_tensor *t1, ggml_tensor *t2, void *user_data) -> bool {
+            callback_userdata *ud = (callback_userdata *)user_data;
+
+            // Skip no-op tensors
+            if (t1->op == GGML_OP_NONE) {
+                return true;
+            }
+
+            size_t nelems = ggml_nelements(t1);
+            std::vector<float> f1(nelems), f2(nelems);
+            ggml_backend_tensor_get(t1, f1.data(), 0, ggml_nbytes(t1));
+            ggml_backend_tensor_get(t2, f2.data(), 0, ggml_nbytes(t2));
+
+            for (size_t i = 0; i < nelems; i++) {
+                if (std::isnan(f1[i]) || std::isnan(f2[i])) {
+                    ud->has_nan = true;
+                    ud->ok = false;
+                    return true;
+                }
+                if (std::isinf(f1[i]) || std::isinf(f2[i])) {
+                    ud->has_inf = true;
+                    ud->ok = false;
+                    return true;
+                }
+            }
+
+            double err = nmse(f1.data(), f2.data(), nelems);
+            ud->nmse_sum += err;
+            ud->nmse_count++;
+
+            if (err > 1e-7) {
+                ud->ok = false;
+            }
+
+            return true;
+        };
+
+        bool compare_ok = ggml_backend_compare_graph_backend(
+            cpu_ref, gpu, gf, callback, &ud, nullptr, 0);
+
+        out_nmse = ud.nmse_count > 0 ? ud.nmse_sum / ud.nmse_count : 0.0;
 
         if (verbose) {
             printf("%s\n", label().c_str());
-            printf("  output elements: %zu\n", out_nels);
-            printf("  NMSE: %.9e  (tolerance: 1e-7)\n", err);
-            if (has_nan)  printf("  WARNING: NaN detected in GPU output\n");
-            if (has_inf)  printf("  WARNING: Inf detected in GPU output\n");
-            printf("  %s\n", err <= 1e-7 ? "[PASS]" : "[FAIL]");
+            printf("  NMSE: %.9e  (tolerance: 1e-7)\n", out_nmse);
+            if (ud.has_nan)  printf("  WARNING: NaN detected\n");
+            if (ud.has_inf)  printf("  WARNING: Inf detected\n");
+            printf("  %s\n", compare_ok && ud.ok ? "[PASS]" : "[FAIL]");
         }
 
-        return err <= 1e-7 && !has_nan;
+        return compare_ok && ud.ok;
     }
 };
 
@@ -351,62 +367,30 @@ int main(int argc, char **argv) {
     printf("Tests: %zu configurations × %zu backends = %zu total\n\n",
            tests.size(), backends.size(), tests.size() * backends.size());
 
-    // Run tests
-    int total_pass = 0, total_fail = 0, total_skip = 0;
-    std::mutex mtx;
-    std::vector<std::tuple<std::string, double, bool>> results;
+    // Run tests sequentially per backend (backends are not thread-safe for
+    // concurrent graph compute; see ggml-backend-compare API docs)
+    int total_pass = 0, total_fail = 0;
 
     for (auto &[gpu_dev, gpu_backend] : backends) {
         printf("Testing backend: %s\n", ggml_backend_dev_name(gpu_dev));
         printf("-----------------------------------------------\n");
 
-        std::atomic<size_t> next_test(0);
-        std::vector<std::thread> workers;
-        const int n_workers = std::min((int)std::thread::hardware_concurrency(), 4);
-
-        auto run_worker = [&](ggml_backend_t gpu, ggml_backend_dev_t gpu_dev) {
-            while (true) {
-                size_t idx = next_test.fetch_add(1);
-                if (idx >= tests.size()) break;
-
-                auto &test = tests[idx];
-                double nmse_val = 0.0;
-                bool pass = test.run(gpu, cpu_ref, nmse_val, false);
-
-                std::lock_guard<std::mutex> lock(mtx);
-                results.emplace_back(test.label(), nmse_val, pass);
-            }
-        };
-
-        for (int w = 0; w < n_workers; w++) {
-            workers.emplace_back(run_worker, gpu_backend, gpu_dev);
-        }
-        for (auto &th : workers) th.join();
-
-        // Sort results for this backend by label
-        std::sort(results.begin(), results.end(),
-                  [](const auto &a, const auto &b) {
-                      return std::get<0>(a) < std::get<0>(b);
-                  });
-
-        // Print results
         int n_pass = 0, n_fail = 0;
-        for (auto &[label, nmse, pass] : results) {
-            printf("%-70s ", label.c_str());
+        for (const auto &test : tests) {
+            double nmse_val = 0.0;
+            bool pass = test.run(gpu_backend, cpu_ref, nmse_val, false);
+            printf("%-70s ", test.label().c_str());
             if (pass) {
-                printf("[PASS]  NMSE=%.2e\n", nmse);
+                printf("[PASS]  NMSE=%.2e\n", nmse_val);
                 n_pass++;
             } else {
-                printf("[FAIL]  NMSE=%.2e\n", nmse);
+                printf("[FAIL]  NMSE=%.2e\n", nmse_val);
                 n_fail++;
             }
         }
         printf("\n  Results: %d passed, %d failed\n\n", n_pass, n_fail);
         total_pass += n_pass;
         total_fail += n_fail;
-
-        // Clear results for next backend
-        results.clear();
     }
 
     // Summary
