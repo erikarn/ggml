@@ -223,6 +223,98 @@ struct gdn_prefill_test {
 
         return compare_ok && ud.ok;
     }
+
+
+    // CPU self-test: build graph once, allocate on backend, init inputs once,
+    // then run the same graph twice and compare outputs. Verifies determinism
+    // (no NaN/Inf, reproducible results) without needing a GPU.
+    bool run_cpu_self_test(ggml_backend_t backend, double &out_nmse,
+                           bool verbose = false) const {
+        ggml_init_params params = {
+            /* .mem_size = */ 64 * 1024 * 1024, // 64 MB for large graphs
+            /* .mem_base = */ nullptr,
+            /* .no_alloc = */ true,
+        };
+        auto ctx = std::unique_ptr<ggml_context, decltype(&free)>(
+            (ggml_context *)malloc(params.mem_size), free);
+        if (!ctx) {
+            fprintf(stderr, "%s: cpu self-test context alloc failed\n", label().c_str());
+            return false;
+        }
+
+        ggml_context *gc = ggml_init(params);
+        if (!gc) {
+            fprintf(stderr, "%s: cpu self-test ggml_init failed\n", label().c_str());
+            return false;
+        }
+
+        const int64_t g_ne0 = kda ? head_size : 1;
+        const int64_t h_v = head_count * v_repeat;
+
+        ggml_tensor *q  = ggml_new_tensor_4d(gc, GGML_TYPE_F32, head_size, head_count,      n_seq_tokens, n_seqs);
+        ggml_tensor *k  = ggml_new_tensor_4d(gc, GGML_TYPE_F32, head_size, head_count,      n_seq_tokens, n_seqs);
+        ggml_tensor *v  = ggml_new_tensor_4d(gc, GGML_TYPE_F32, head_size, h_v,             n_seq_tokens, n_seqs);
+        ggml_tensor *g  = ggml_new_tensor_4d(gc, GGML_TYPE_F32, g_ne0,     h_v,             n_seq_tokens, n_seqs);
+        ggml_tensor *b  = ggml_new_tensor_4d(gc, GGML_TYPE_F32, 1,         h_v,             n_seq_tokens, n_seqs);
+        ggml_tensor *st = ggml_new_tensor_4d(gc, GGML_TYPE_F32, head_size, head_size,       h_v,          n_seqs);
+
+        q = ggml_l2_norm(gc, q, 1e-6f);
+        k = ggml_l2_norm(gc, k, 1e-6f);
+        ggml_tensor *out = ggml_gated_delta_net(gc, q, k, v, g, b, st, K);
+
+        ggml_cgraph *gf = ggml_new_graph(gc);
+        ggml_build_forward_expand(gf, out);
+
+        // Allocate on backend
+        ggml_backend_buffer_ptr buf(
+            ggml_backend_alloc_ctx_tensors(gc, backend));
+        if (!buf) {
+            fprintf(stderr, "%s: cpu self-test allocation failed\n", label().c_str());
+            return false;
+        }
+
+        // Initialize leaf input tensors once (skip views and computed intermediates)
+        for (ggml_tensor *t = ggml_get_first_tensor(gc); t != nullptr;
+             t = ggml_get_next_tensor(gc, t)) {
+            if (ggml_is_view(t)) continue;
+            if (t->op == GGML_OP_L2_NORM) continue;
+            init_tensor_uniform(t);
+        }
+
+        // Run twice, compare outputs
+        std::vector<float> out1, out2;
+        size_t nelems = ggml_nelements(out);
+
+        ggml_backend_graph_compute(backend, gf);
+        out1.resize(nelems);
+        ggml_backend_tensor_get(out, out1.data(), 0, ggml_nbytes(out));
+
+        ggml_backend_graph_compute(backend, gf);
+        out2.resize(nelems);
+        ggml_backend_tensor_get(out, out2.data(), 0, ggml_nbytes(out));
+
+        size_t nelems_check = out1.size();
+        bool has_nan = false, has_inf = false;
+        for (size_t i = 0; i < nelems_check; i++) {
+            if (std::isnan(out1[i]) || std::isnan(out2[i])) { has_nan = true; break; }
+            if (std::isinf(out1[i]) || std::isinf(out2[i])) { has_inf = true; break; }
+        }
+
+        double err = nmse(out1.data(), out2.data(), nelems_check);
+        out_nmse = err;
+        bool consistent = (err <= 1e-7);
+        bool valid = !has_nan && !has_inf;
+
+        if (verbose) {
+            printf("%s\n", label().c_str());
+            printf("  NMSE: %.9e  (tolerance: 1e-7)\n", out_nmse);
+            if (has_nan)   printf("  WARNING: NaN detected\n");
+            if (has_inf)   printf("  WARNING: Inf detected\n");
+            printf("  %s\n", (consistent && valid) ? "[PASS]" : "[FAIL]");
+        }
+
+        return consistent && valid;
+    }
 };
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -231,8 +323,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "Options:\n"
-        "  -b <backend>   Backend name (default: all available)\n"
+        "  -b <backend>   Backend name (default: all available accelerators)\n"
         "  -p <list>      Comma-separated n_seq_tokens values (default: all)\n"
+        "  --cpu          Run CPU self-test (CPU vs CPU, no GPU needed)\n"
         "  -h             Show this help\n"
         "\n"
         "Examples:\n"
@@ -240,12 +333,14 @@ static void print_usage(const char *prog) {
         "  %s -b \"Vulkan\"                  # test only Vulkan\n"
         "  %s -p 5,9,10,16,32              # specific token counts\n"
         "  %s -p 5,6,7,8,9,10,11,12        # boundary sweep\n"
-        "\n", prog, prog, prog, prog, prog);
+        "  %s --cpu                         # CPU self-test (no GPU required)\n"
+        "\n", prog, prog, prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv) {
     const char *backend_filter = nullptr;
     std::vector<int64_t> token_counts; // empty = use defaults
+    bool cpu_self_test = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
@@ -263,6 +358,8 @@ int main(int argc, char **argv) {
                 if (*start == ',') start++;
                 else break;
             }
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            cpu_self_test = true;
         } else if (strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -277,47 +374,71 @@ int main(int argc, char **argv) {
 
     // Collect backends to test
     std::vector<std::pair<ggml_backend_dev_t, ggml_backend_t>> backends;
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        const char *name = ggml_backend_dev_name(dev);
-        if (backend_filter && strcmp(name, backend_filter) != 0) {
-            continue;
-        }
-        // Only test accelerators (not CPU for comparison)
-        enum ggml_backend_dev_type btype = ggml_backend_dev_type(dev);
-        if (btype == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            continue;
-        }
-        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-        if (backend) {
-            backends.emplace_back(dev, backend);
-        }
-    }
+    ggml_backend_t cpu_ref = nullptr;
 
-    if (backends.empty()) {
-        fprintf(stderr, "No suitable GPU backends found.\n");
-        return 1;
-    }
-
-    // CPU reference backend
-    ggml_backend_dev_t cpu_dev = nullptr;
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            cpu_dev = dev;
-            break;
+    if (cpu_self_test) {
+        // CPU self-test: use CPU backend as both reference and target
+        ggml_backend_dev_t cpu_dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                cpu_dev = dev;
+                break;
+            }
         }
+        if (!cpu_dev) {
+            fprintf(stderr, "CPU backend not found.\n");
+            return 1;
+        }
+        ggml_backend_t cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
+        if (!cpu_backend) {
+            fprintf(stderr, "Failed to initialize CPU backend.\n");
+            return 1;
+        }
+        backends.emplace_back(cpu_dev, cpu_backend);
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const char *name = ggml_backend_dev_name(dev);
+            if (backend_filter && strcmp(name, backend_filter) != 0) {
+                continue;
+            }
+            // Only test accelerators (not CPU for comparison)
+            enum ggml_backend_dev_type btype = ggml_backend_dev_type(dev);
+            if (btype == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend) {
+                backends.emplace_back(dev, backend);
+            }
+        }
+
+        if (backends.empty()) {
+            fprintf(stderr, "No suitable GPU backends found.\n");
+            return 1;
+        }
+
+        // CPU reference backend
+        ggml_backend_dev_t cpu_dev = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                cpu_dev = dev;
+                break;
+            }
+        }
+        if (!cpu_dev) {
+            fprintf(stderr, "CPU backend not found.\n");
+            return 1;
+        }
+        cpu_ref = ggml_backend_dev_init(cpu_dev, nullptr);
+        using set_use_ref_fn = void (*)(ggml_backend_t, bool);
+        auto *reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto set_use_ref = (set_use_ref_fn)ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cpu_set_use_ref");
+        if (set_use_ref) set_use_ref(cpu_ref, true);
     }
-    if (!cpu_dev) {
-        fprintf(stderr, "CPU backend not found.\n");
-        return 1;
-    }
-    ggml_backend_t cpu_ref = ggml_backend_dev_init(cpu_dev, nullptr);
-    using set_use_ref_fn = void (*)(ggml_backend_t, bool);
-    auto *reg = ggml_backend_dev_backend_reg(cpu_dev);
-    auto set_use_ref = (set_use_ref_fn)ggml_backend_reg_get_proc_address(
-        reg, "ggml_backend_cpu_set_use_ref");
-    if (set_use_ref) set_use_ref(cpu_ref, true);
 
     // Define test parameters
     // Default: full sweep matching GDN_PREFILL_CORRUPTION_TEST.md
@@ -365,8 +486,13 @@ int main(int argc, char **argv) {
 
     // Print header
     printf("=============================================================\n");
-    printf("GDN Prefill Corruption Test (libggml only)\n");
-    printf("Issue: #21888 — Qwen3.5 GDN chunked prefill on Intel iGPU\n");
+    if (cpu_self_test) {
+        printf("GDN Prefill CPU Self-Test (libggml only)\n");
+        printf("Verifying CPU implementation correctness across window sizes\n");
+    } else {
+        printf("GDN Prefill Corruption Test (libggml only)\n");
+        printf("Issue: #21888 — Qwen3.5 GDN chunked prefill on Intel iGPU\n");
+    }
     printf("=============================================================\n\n");
 
     printf("Backends:\n");
@@ -374,7 +500,10 @@ int main(int argc, char **argv) {
         printf("  - %s (%s)\n", ggml_backend_dev_name(dev),
                ggml_backend_dev_description(dev));
     }
-    printf("  - CPU (reference)\n\n");
+    if (!cpu_self_test) {
+        printf("  - CPU (reference)\n");
+    }
+    printf("\n");
 
     printf("Tests: %zu configurations × %zu backends = %zu total\n\n",
            tests.size(), backends.size(), tests.size() * backends.size());
@@ -383,14 +512,21 @@ int main(int argc, char **argv) {
     // concurrent graph compute; see ggml-backend-compare API docs)
     int total_pass = 0, total_fail = 0;
 
-    for (auto &[gpu_dev, gpu_backend] : backends) {
-        printf("Testing backend: %s\n", ggml_backend_dev_name(gpu_dev));
+    for (auto &[bk_dev, bk_backend] : backends) {
+        printf("Testing backend: %s\n", ggml_backend_dev_name(bk_dev));
         printf("-----------------------------------------------\n");
 
         int n_pass = 0, n_fail = 0;
         for (const auto &test : tests) {
             double nmse_val = 0.0;
-            bool pass = test.run(gpu_backend, cpu_ref, nmse_val, true);
+            bool pass;
+            if (cpu_self_test) {
+                // CPU self-test: run twice on the same backend, compare results
+                // This verifies internal consistency and detects NaN/Inf
+                pass = test.run_cpu_self_test(bk_backend, nmse_val, true);
+            } else {
+                pass = test.run(bk_backend, cpu_ref, nmse_val, true);
+            }
             printf("%-70s ", test.label().c_str());
             if (pass) {
                 printf("[PASS]  NMSE=%.2e\n", nmse_val);
@@ -415,7 +551,9 @@ int main(int argc, char **argv) {
     for (auto &[dev, bk] : backends) {
         ggml_backend_free(bk);
     }
-    ggml_backend_free(cpu_ref);
+    if (!cpu_self_test) {
+        ggml_backend_free(cpu_ref);
+    }
 
     return total_fail > 0 ? 1 : 0;
 }
