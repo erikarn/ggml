@@ -372,3 +372,17 @@ add_executable(${TEST_TARGET2} ${TEST_TARGET2}.cpp)
 target_link_libraries(${TEST_TARGET2} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET2} COMMAND $<TARGET_FILE:${TEST_TARGET2}>)
 set_property(TEST ${TEST_TARGET2} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET2}.profraw")
+
+# test-gdn-boundary — sweep n_tokens to find exact NaN transition boundary
+set(TEST_TARGET3 test-gdn-boundary)
+add_executable(${TEST_TARGET3} ${TEST_TARGET3}.cpp)
+target_link_libraries(${TEST_TARGET3} PRIVATE ggml Threads::Threads)
+add_test(NAME ${TEST_TARGET3} COMMAND $<TARGET_FILE:${TEST_TARGET3}>)
+set_property(TEST ${TEST_TARGET3} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET3}.profraw")
+
+# test-gdn-boundary-distribution — boundary sweep with value distribution output
+set(TEST_TARGET4 test-gdn-boundary-distribution)
+add_executable(${TEST_TARGET4} ${TEST_TARGET4}.cpp)
+target_link_libraries(${TEST_TARGET4} PRIVATE ggml Threads::Threads)
+add_test(NAME ${TEST_TARGET4} COMMAND $<TARGET_FILE:${TEST_TARGET4}>)
+set_property(TEST ${TEST_TARGET4} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET4}.profraw")
