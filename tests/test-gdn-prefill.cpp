@@ -211,9 +211,11 @@ struct gdn_prefill_test {
 
         out_nmse = ud.nmse_count > 0 ? ud.nmse_sum / ud.nmse_count : 0.0;
 
-        if (verbose) {
+        if (verbose || !compare_ok || !ud.ok) {
             printf("%s\n", label().c_str());
+            printf("  compare_ok=%d ud.ok=%d\n", compare_ok, ud.ok);
             printf("  NMSE: %.9e  (tolerance: 1e-7)\n", out_nmse);
+            printf("  nmse_count=%zu\n", ud.nmse_count);
             if (ud.has_nan)  printf("  WARNING: NaN detected\n");
             if (ud.has_inf)  printf("  WARNING: Inf detected\n");
             printf("  %s\n", compare_ok && ud.ok ? "[PASS]" : "[FAIL]");
@@ -322,12 +324,17 @@ int main(int argc, char **argv) {
     std::vector<gdn_prefill_test> tests;
 
     if (token_counts.empty()) {
-        // Full sweep: working length, failing lengths, boundaries
+        // Full sweep: working length, failing lengths, boundaries up to 8192
         std::vector<int64_t> tokens = {
             1, 2, 3, 4, 5,   // short sequences (working)
             6, 7, 8, 9, 10,  // transition zone
             11, 12, 13, 14, 15, 16,  // power-of-2 boundary
-            32, 64, 127, 128, 200, 256  // larger contexts
+            32, 64, 127, 128, 200, 256,  // larger contexts
+            512,             // power-of-2
+            1024,            // power-of-2
+            2047, 2048, 2049, // +/-1 around 2K boundary
+            4095, 4096, 4097, // +/-1 around 4K boundary
+            8191, 8192, 8193  // +/-1 around 8K boundary
         };
         for (int64_t t : tokens) {
             // Primary: Qwen3.5 dimensions, KDA mode
@@ -341,9 +348,14 @@ int main(int argc, char **argv) {
             tests.emplace_back(32, 128, t, 1, 1, true, 4);
             tests.emplace_back(32, 128, t, 1, 1, true, 8);
         }
-        // Overflow cases (n_tokens > K)
+        // Overflow cases (n_tokens >> K) at extended boundaries
         tests.emplace_back(32, 128, 16, 1, 1, true, 4);
         tests.emplace_back(32, 128, 32, 1, 1, true, 4);
+        tests.emplace_back(32, 128, 1024, 1, 1, true, 4);   // 256x overflow
+        tests.emplace_back(32, 128, 4096, 1, 1, true, 4);   // 1024x overflow
+        tests.emplace_back(32, 128, 8192, 1, 1, true, 4);   // 2048x overflow
+        tests.emplace_back(32, 128, 4096, 1, 1, true, 16);  // 256x overflow, K=16
+        tests.emplace_back(32, 128, 8192, 1, 1, true, 16);  // 512x overflow, K=16
     } else {
         for (int64_t t : token_counts) {
             tests.emplace_back(32, 128, t, 1, 1, true, 1);
@@ -378,7 +390,7 @@ int main(int argc, char **argv) {
         int n_pass = 0, n_fail = 0;
         for (const auto &test : tests) {
             double nmse_val = 0.0;
-            bool pass = test.run(gpu_backend, cpu_ref, nmse_val, false);
+            bool pass = test.run(gpu_backend, cpu_ref, nmse_val, true);
             printf("%-70s ", test.label().c_str());
             if (pass) {
                 printf("[PASS]  NMSE=%.2e\n", nmse_val);
