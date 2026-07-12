@@ -364,3 +364,11 @@ add_executable(${TEST_TARGET} ${TEST_TARGET}.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml Threads::Threads)
 add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 set_property(TEST ${TEST_TARGET} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET}.profraw")
+
+# test-narrow-gdn — narrow diagnostic: Vulkan vs CPU on n_tokens=512, kda=true
+# (first point of divergence between backends)
+set(TEST_TARGET2 test-narrow-gdn)
+add_executable(${TEST_TARGET2} ${TEST_TARGET2}.cpp)
+target_link_libraries(${TEST_TARGET2} PRIVATE ggml Threads::Threads)
+add_test(NAME ${TEST_TARGET2} COMMAND $<TARGET_FILE:${TEST_TARGET2}>)
+set_property(TEST ${TEST_TARGET2} PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${TEST_TARGET2}.profraw")
